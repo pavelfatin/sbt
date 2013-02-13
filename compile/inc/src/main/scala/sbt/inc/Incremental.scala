@@ -16,7 +16,7 @@ object Incremental
 	final val TransitiveStep = 2
 	final val RecompileAllFraction = 0.5
 
-	def compile(sources: Set[File], entry: String => Option[File], previous: Analysis, current: ReadStamps, forEntry: File => Option[Analysis], doCompile: (Set[File], DependencyChanges) => Analysis, log: Logger)(implicit equivS: Equiv[Stamp]): (Boolean, Analysis) =
+	def compile(sources: Set[File], entry: String => Option[File], previous: Analysis, current: ReadStamps, forEntry: File => Option[Analysis], doCompile: (Set[File], DependencyChanges) => Analysis, deletionListener: Option[File => Unit], log: Logger)(implicit equivS: Equiv[Stamp]): (Boolean, Analysis) =
 	{
 		val initialChanges = changedInitial(entry, sources, previous, current, forEntry)
 		val binaryChanges = new DependencyChanges {
@@ -26,14 +26,14 @@ object Incremental
 		}
 		val initialInv = invalidateInitial(previous.relations, initialChanges, log)
 		log.debug("Initially invalidated: " + initialInv)
-		val analysis = cycle(initialInv, sources, binaryChanges, previous, doCompile, 1, log)
+		val analysis = cycle(initialInv, sources, binaryChanges, previous, doCompile, 1, deletionListener, log)
 		(!initialInv.isEmpty, analysis)
 	}
 
 	val incDebugProp = "xsbt.inc.debug"
 	// TODO: the Analysis for the last successful compilation should get returned + Boolean indicating success
 	// TODO: full external name changes, scopeInvalidations
-	def cycle(invalidatedRaw: Set[File], allSources: Set[File], binaryChanges: DependencyChanges, previous: Analysis, doCompile: (Set[File], DependencyChanges) => Analysis, cycleNum: Int, log: Logger): Analysis =
+	def cycle(invalidatedRaw: Set[File], allSources: Set[File], binaryChanges: DependencyChanges, previous: Analysis, doCompile: (Set[File], DependencyChanges) => Analysis, cycleNum: Int, deletionListener: Option[File => Unit], log: Logger): Analysis =
 		if(invalidatedRaw.isEmpty)
 			previous
 		else
@@ -41,7 +41,7 @@ object Incremental
 			def debug(s: => String) = if(java.lang.Boolean.getBoolean(incDebugProp)) log.debug(s) else ()
 			val withPackageObjects = invalidatedRaw ++ invalidatedPackageObjects(invalidatedRaw, previous.relations)
 			val invalidated = expand(withPackageObjects, allSources, log)
-			val pruned = prune(invalidated, previous)
+			val pruned = prune(invalidated, previous, deletionListener)
 			debug("********* Pruned: \n" + pruned.relations + "\n*********")
 			val fresh = doCompile(invalidated, binaryChanges)
 			debug("********* Fresh: \n" + fresh.relations + "\n*********")
@@ -50,7 +50,7 @@ object Incremental
 			val incChanges = changedIncremental(invalidated, previous.apis.internalAPI _, merged.apis.internalAPI _)
 			debug("Changes:\n" + incChanges)
 			val incInv = invalidateIncremental(merged.relations, incChanges, invalidated, cycleNum >= TransitiveStep, log)
-			cycle(incInv, allSources, emptyChanges, merged, doCompile, cycleNum+1, log)
+			cycle(incInv, allSources, emptyChanges, merged, doCompile, cycleNum+1, deletionListener, log)
 		}
 	private[this] def emptyChanges: DependencyChanges = new DependencyChanges {
 		val modifiedBinaries = new Array[File](0)
@@ -215,11 +215,13 @@ object Incremental
 		srcDirect ++ byProduct ++ byBinaryDep ++ byExtSrcDep
 	}
 
-	def prune(invalidatedSrcs: Set[File], previous: Analysis): Analysis =
+	def prune(invalidatedSrcs: Set[File], previous: Analysis, deletionListener: Option[File => Unit]): Analysis =
 	{
-		IO.deleteFilesEmptyDirs( invalidatedSrcs.flatMap(previous.relations.products) )
-		previous -- invalidatedSrcs
-	}
+    val filesToDelete = invalidatedSrcs.flatMap(previous.relations.products)
+    IO.deleteFilesEmptyDirs( filesToDelete )
+    deletionListener.foreach(listener => filesToDelete.foreach(listener(_)))
+    previous -- invalidatedSrcs
+  }
 
 	def externalBinaryModified(entry: String => Option[File], analysis: File => Option[Analysis], previous: Stamps, current: ReadStamps)(implicit equivS: Equiv[Stamp]): File => Boolean =
 		dependsOn =>

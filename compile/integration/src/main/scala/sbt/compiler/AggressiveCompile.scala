@@ -21,26 +21,26 @@ import inc._
 
 final class CompileConfiguration(val sources: Seq[File], val classpath: Seq[File],
 	val previousAnalysis: Analysis, val previousSetup: Option[CompileSetup], val currentSetup: CompileSetup, val progress: Option[CompileProgress], val getAnalysis: File => Option[Analysis], val definesClass: DefinesClass,
-	val reporter: Reporter, val compiler: Option[AnalyzingCompiler], val javac: xsbti.compile.JavaCompiler, val cache: GlobalsCache)
+	val reporter: Reporter, val listener: Option[CompileListener], val compiler: Option[AnalyzingCompiler], val javac: xsbti.compile.JavaCompiler, val cache: GlobalsCache)
 
 class AggressiveCompile(cacheFile: File)
 {
-	def apply(compiler: Option[AnalyzingCompiler], javac: xsbti.compile.JavaCompiler, sources: Seq[File], classpath: Seq[File], output: Output, cache: GlobalsCache, progress: Option[CompileProgress] = None, options: Seq[String] = Nil, javacOptions: Seq[String] = Nil, analysisMap: File => Option[Analysis] = { _ => None }, definesClass: DefinesClass = Locate.definesClass _, reporter: Reporter, compileOrder: CompileOrder = Mixed, skip: Boolean = false)(implicit log: Logger): Analysis =
+	def apply(compiler: Option[AnalyzingCompiler], javac: xsbti.compile.JavaCompiler, sources: Seq[File], classpath: Seq[File], output: Output, cache: GlobalsCache, progress: Option[CompileProgress] = None, options: Seq[String] = Nil, javacOptions: Seq[String] = Nil, analysisMap: File => Option[Analysis] = { _ => None }, definesClass: DefinesClass = Locate.definesClass _, reporter: Reporter, listener: Option[CompileListener] = None, compileOrder: CompileOrder = Mixed, skip: Boolean = false)(implicit log: Logger): Analysis =
 	{
 		val setup = new CompileSetup(output, new CompileOptions(options, javacOptions), compiler.map(_.scalaInstance.actualVersion).getOrElse(""), compileOrder)
-		compile1(sources, classpath, setup, progress, store, analysisMap, definesClass, compiler, javac, reporter, skip, cache)
+		compile1(sources, classpath, setup, progress, store, analysisMap, definesClass, compiler, javac, reporter, listener, skip, cache)
 	}
 
 	def withBootclasspath(args: CompilerArguments, classpath: Seq[File]): Seq[File] =
 		args.bootClasspathFor(classpath) ++ args.finishClasspath(classpath)
 
-	def compile1(sources: Seq[File], classpath: Seq[File], setup: CompileSetup, progress: Option[CompileProgress], store: AnalysisStore, analysis: File => Option[Analysis], definesClass: DefinesClass, compiler: Option[AnalyzingCompiler], javac: xsbti.compile.JavaCompiler, reporter: Reporter, skip: Boolean, cache: GlobalsCache)(implicit log: Logger): Analysis =
+	def compile1(sources: Seq[File], classpath: Seq[File], setup: CompileSetup, progress: Option[CompileProgress], store: AnalysisStore, analysis: File => Option[Analysis], definesClass: DefinesClass, compiler: Option[AnalyzingCompiler], javac: xsbti.compile.JavaCompiler, reporter: Reporter, listener: Option[CompileListener], skip: Boolean, cache: GlobalsCache)(implicit log: Logger): Analysis =
 	{
 		val (previousAnalysis, previousSetup) = extract(store.get())
 		if(skip)
 			previousAnalysis
 		else {
-			val config = new CompileConfiguration(sources, classpath, previousAnalysis, previousSetup, setup, progress, analysis, definesClass, reporter, compiler, javac, cache)
+			val config = new CompileConfiguration(sources, classpath, previousAnalysis, previousSetup, setup, progress, analysis, definesClass, reporter, listener, compiler, javac, cache)
 			val (modified, result) = compile2(config)
 			if(modified)
 				store.set(result, setup)
@@ -58,8 +58,11 @@ class AggressiveCompile(cacheFile: File)
       cArgs.map(it => withBootclasspath(it, absClasspath)).getOrElse(absClasspath)
 		val entry = Locate.entry(searchClasspath, definesClass)
 		
-		val compile0 = (include: Set[File], changes: DependencyChanges, callback: AnalysisCallback) => {
-			val outputDirs = outputDirectories(output)
+		val compile0 = (include: Set[File], changes: DependencyChanges, externalCallback: AnalysisCallback) => {
+      val callback = config.listener
+        .map(listener => new CompoundAnalysisCallback(externalCallback, new CompileListenerAdapter(listener)))
+        .getOrElse(externalCallback)
+      val outputDirs = outputDirectories(output)
 			outputDirs foreach (IO.createDirectory)
 			val incSrc = sources.filter(include)
 			val (javaSrcs, scalaSrcs) = incSrc partition javaOnly
@@ -114,13 +117,15 @@ class AggressiveCompile(cacheFile: File)
 				}
 			if(order == JavaThenScala) { compileJava(); compileScala() } else { compileScala(); compileJava() }
 		}
-		
-		val sourcesSet = sources.toSet
+
+    val deletionListener = (file: File) => listener.foreach(_.deleted(file))
+
+    val sourcesSet = sources.toSet
 		val analysis = previousSetup match {
 			case Some(previous) if equiv.equiv(previous, currentSetup) => previousAnalysis
-			case _ => Incremental.prune(sourcesSet, previousAnalysis)
+			case _ => Incremental.prune(sourcesSet, previousAnalysis, Some(deletionListener))
 		}
-		IncrementalCompile(sourcesSet, entry, compile0, analysis, getAnalysis, output, log)
+		IncrementalCompile(sourcesSet, entry, compile0, analysis, getAnalysis, output, Some(deletionListener), log)
 	}
 	private[this] def outputDirectories(output: Output): Seq[File] = output match {
 		case single: SingleOutput => List(single.outputDirectory)
